@@ -1,0 +1,59 @@
+AMAZON.AE SELLER DASHBOARD — SETUP ON ANOTHER PC (Windows)
+==========================================================
+
+WHAT YOU COPY
+  Just one file:  seller_dashboard_full.zip
+  (It contains the whole app. It does NOT contain the "venv" folder, the local
+   database, or any API keys — those are created fresh / re-entered on the new PC.)
+
+
+STEP 1 — Install Python (once)
+  1. Go to  https://www.python.org/downloads/
+  2. Download Python 3.11 or newer.
+  3. Run the installer and IMPORTANT: tick "Add Python to PATH" before clicking Install.
+
+
+STEP 2 — Copy & extract the app
+  1. Copy  seller_dashboard_full.zip  to the new PC (USB, email, drive — anywhere).
+  2. Right-click it -> "Extract All...".
+  3. You now have a folder:  seller_dashboard\
+
+
+STEP 3 — Start it
+  1. Open the  seller_dashboard  folder.
+  2. Double-click  Start_Dashboard.bat
+        First run: it builds a local "venv" and installs the libraries
+        (a few minutes, ONE time, needs internet).
+        Every run after: it just launches (fast).
+  3. A browser opens at  http://localhost:8501
+  4. Log in:   user: admin     password: your local password
+
+
+STEP 4 — Enter your keys & credentials (once, on this PC)
+  Open the left menu -> Settings, and fill in:
+
+  AMAZON SP-API (for listing/creation/inventory):
+    - LWA Client ID
+    - LWA Client Secret
+    - Refresh Token
+    - Seller ID
+    - Marketplace ID    (UAE = A2VIGQ35RCS4UG, already the default)
+    - Region            (eu)
+    Then turn OFF "Use MOCK Amazon" to go live.
+
+  AI KEYS:
+    - Anthropic (Claude) API key   -> powers copywriting, policy checks, A+ content
+    - OpenAI API key               -> powers image generation (gpt-image-2)
+    - (models default to claude-opus-4-8 and gpt-image-2)
+
+  These are stored ONLY in this PC's local database (data\seller.db).
+  They never leave the machine except for the API calls themselves.
+
+
+NOTES
+  - Needs internet (Amazon SP-API + Anthropic + OpenAI).
+  - To STOP the app: close the black launcher window (or Ctrl+C in it).
+  - To UPDATE later: replace the app files with a newer seller_dashboard_full.zip
+    (keep your data\ folder to preserve your keys/settings), then run the .bat again.
+  - If the .bat says "Python was not found": you missed "Add Python to PATH" in Step 1.
+    Re-run the Python installer, choose Modify, and enable it (or reinstall).
