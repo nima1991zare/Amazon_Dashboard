@@ -333,8 +333,14 @@ def add_ready_to_list(sku: str, title: str, price: float, images: list, payload:
 
 
 def get_ready_to_list() -> list[dict]:
+    """Pushed items, newest first. Joins the catalog so each row carries the
+    confirmed `asin` (empty = Amazon never confirmed it was created) — the
+    Submitted/Ready-to-List view uses that to show a truthful created/pending status."""
     with _conn() as c:
-        rows = c.execute("SELECT * FROM ready_to_list ORDER BY created_at DESC").fetchall()
+        rows = c.execute(
+            "SELECT r.*, c.asin AS asin, c.status AS cat_status "
+            "FROM ready_to_list r LEFT JOIN catalog c ON c.sku = r.sku "
+            "ORDER BY r.created_at DESC").fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -342,6 +348,19 @@ def get_ready_to_list() -> list[dict]:
         d["payload"] = json.loads(d["payload"]) if d["payload"] else {}
         out.append(d)
     return out
+
+
+def delete_ready_to_list(skus) -> int:
+    """Remove every ready_to_list row for the given SKUs (used to clear entries that
+    Amazon never actually created). Returns the number of rows deleted."""
+    skus = [s for s in (skus or []) if s]
+    if not skus:
+        return 0
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM ready_to_list WHERE sku IN (%s)" % ",".join("?" * len(skus)),
+            skus)
+        return cur.rowcount
 
 
 def get_created_log() -> list[dict]:

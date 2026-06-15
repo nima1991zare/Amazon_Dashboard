@@ -217,34 +217,85 @@ def search_catalog_items(identifier: str, id_type: str = "GTIN") -> list[dict]:
     return r.json().get("items", [])
 
 
-def get_listing_status(sku: str) -> dict:
-    """Confirm a listing directly (getListingsItem) — the authoritative answer to
-    'did it actually get created?', independent of the slow feed report.
+def _derive_amazon_status(statuses: set, all_issues: list, offers_present: bool,
+                          qty) -> str:
+    """Map raw SP-API signals to the seller-facing status the user sees in Seller
+    Central: Active / Out of stock / Missing offer / Missing information /
+    Search suppressed / Suppressed / Inactive."""
+    actions = set()
+    for i in all_issues or []:
+        for a in i.get("enforcements", []) or []:
+            actions.add(a)
+    if "SEARCH_SUPPRESSED" in actions:
+        return "Search suppressed"
+    if any(a in actions for a in ("LISTING_SUPPRESSED", "CATALOG_ITEM_REMOVED")):
+        return "Suppressed"
+    if any(i.get("severity") == "ERROR" for i in (all_issues or [])):
+        return "Missing information"
+    if "BUYABLE" in statuses:
+        if qty is not None and qty <= 0:
+            return "Out of stock"
+        return "Active"
+    # Discoverable in the catalog but not buyable → no live offer, or zero stock.
+    if "DISCOVERABLE" in statuses:
+        if not offers_present:
+            return "Missing offer"
+        if qty is not None and qty <= 0:
+            return "Out of stock"
+        return "Inactive"
+    return "Inactive"
 
-    Returns {exists, status, asin, issues}. status may be a combined string like
-    'BUYABLE, DISCOVERABLE'. A created listing is usually DISCOVERABLE within
-    seconds even while the feed still shows IN_PROGRESS.
+
+def get_listing_status(sku: str) -> dict:
+    """Confirm a listing directly (getListingsItem) and derive its real Amazon status.
+
+    Returns {exists, status, amazon_status, status_list, asin, issues, all_issues}.
+    `amazon_status` is the seller-facing state (Active / Out of stock / Missing offer /
+    Missing information / Search suppressed / …). `status` is the raw BUYABLE/DISCOVERABLE
+    string. A created listing is usually DISCOVERABLE within seconds of submission.
     """
     import requests
     c = creds()
     url = (f"{c['endpoint']}/listings/2021-08-01/items/{c['seller_id']}/"
            f"{requests.utils.quote(str(sku), safe='')}")
     r = _http("get", url, params={"marketplaceIds": c["marketplace_id"],
-                                  "includedData": "summaries,issues",
+                                  "includedData": "summaries,offers,fulfillmentAvailability,issues",
                                   "issueLocale": c["issue_locale"]},
                      headers=_headers(), timeout=20)
     if r.status_code == 404:
-        return {"exists": False, "status": "", "asin": "", "issues": []}
+        return {"exists": False, "status": "", "amazon_status": "Not on Amazon",
+                "status_list": [], "asin": "", "issues": [], "all_issues": []}
     r.raise_for_status()
     j = r.json()
     summ = (j.get("summaries") or [{}])[0]
-    status = summ.get("status")
-    if isinstance(status, list):
-        status = ", ".join(status)
-    errs = [i.get("message", "") for i in j.get("issues", [])
-            if i.get("severity") == "ERROR"]
-    return {"exists": True, "status": status or "", "asin": summ.get("asin", ""),
-            "issues": errs}
+    status_list = summ.get("status") or []
+    if isinstance(status_list, str):
+        status_list = [status_list]
+    # Keep EVERY issue (not just blocking errors): Amazon reports missing/incomplete
+    # information as WARNING severity — that's the "listing is missing info" the seller
+    # sees. Each carries the attribute name(s) and any enforcement (e.g. SEARCH_SUPPRESSED).
+    all_issues = [{"severity": i.get("severity", ""), "message": i.get("message", ""),
+                   "attributes": i.get("attributeNames", []) or [],
+                   "code": i.get("code", ""),
+                   "enforcements": [a.get("action") for a in
+                                    ((i.get("enforcements", {}) or {}).get("actions", []) or [])
+                                    if a.get("action")]}
+                  for i in (j.get("issues", []) or [])]
+    errs = [i["message"] for i in all_issues if i["severity"] == "ERROR"]
+    # Stock signal: sum fulfillmentAvailability quantities when present (FBM, or FBA
+    # that reports it). None = unknown (don't claim out-of-stock when we can't tell).
+    fa = j.get("fulfillmentAvailability") or []
+    qsum, have_q = 0, False
+    for f in fa:
+        if "quantity" in f:
+            qsum += int(f.get("quantity") or 0)
+            have_q = True
+    qty = qsum if have_q else None
+    amazon_status = _derive_amazon_status(set(status_list), all_issues,
+                                          bool(j.get("offers")), qty)
+    return {"exists": True, "status": ", ".join(status_list),
+            "amazon_status": amazon_status, "status_list": status_list,
+            "asin": summ.get("asin", ""), "issues": errs, "all_issues": all_issues}
 
 
 # ---------------------------------------------------------------------------

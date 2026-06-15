@@ -108,6 +108,47 @@ def fetch_images_from_media_link(media_link: str, sku: str = "") -> dict:
         return {"images": [], "ok": False, "reason": f"oskar fetch error: {e}"}
 
 
+def fetch_product_info(sku: str) -> dict:
+    """Fetch the FULL product record for ONE SKU from connect.oskarme.com.
+
+    Same endpoint as the media fetch (GET /api/v1/product/combined-media?item=<sku>),
+    but returns EVERYTHING connect sends back, not just images:
+        {'ok':bool, 'sku':sku, 'data':<raw 'data' object>, 'images':[url,...], 'reason':str}
+    `data` is whatever connect provides for the product (specs, names, etc.).
+    """
+    sku = str(sku).strip()
+    if not sku:
+        return {"ok": False, "sku": sku, "data": {}, "images": [], "reason": "no SKU"}
+    if _use_mock():
+        m = mock_data.oskar_media_images(sku, "")
+        return {"ok": bool(m.get("images")), "sku": sku, "images": m.get("images", []),
+                "data": {"sku": sku, "source": "mock"}, "reason": m.get("reason", "")}
+    base = (db.get_setting("oskar_base_url", "https://connect.oskarme.com") or
+            "https://connect.oskarme.com").rstrip("/")
+    token = db.get_setting("oskar_token", "")
+    try:
+        import requests
+        headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+        if token:
+            headers["Authorization"] = token   # raw token, NOT "Bearer ..."
+        r = requests.get(f"{base}/api/v1/product/combined-media",
+                         params={"item": sku}, headers=headers, timeout=25)
+        if r.status_code == 401:
+            return {"ok": False, "sku": sku, "data": {}, "images": [],
+                    "reason": "unauthorized — add/refresh your oskar token in Settings"}
+        r.raise_for_status()
+        data = (r.json() or {}).get("data") or {}
+        media = data.get("media") or {}
+        imgs = []
+        if media.get("primaryImage"):
+            imgs.append(media["primaryImage"])
+        imgs += [u for u in (media.get("images") or []) if u]
+        imgs = [u for u in dict.fromkeys(imgs) if isinstance(u, str) and u.startswith("http")]
+        return {"ok": True, "sku": sku, "data": data, "images": imgs, "reason": ""}
+    except Exception as e:
+        return {"ok": False, "sku": sku, "data": {}, "images": [], "reason": f"connect error: {e}"}
+
+
 # ---------------------------------------------------------------------------
 # MODE B — scrape a product page generically
 # ---------------------------------------------------------------------------

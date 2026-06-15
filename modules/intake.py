@@ -1169,6 +1169,29 @@ def _coerce_field_value(field: dict, val):
     return val
 
 
+def _num(x, default: float = 0.0) -> float:
+    """Best-effort number from any value, WITHOUT crashing. Accepts a clean numeric
+    string (optionally with 'AED'/'$'/commas); anything messy (a spec blob like
+    'Dimensions (CM): 36.5*30*35\\nGross Weight…', empty, NaN) → `default`. We do NOT
+    pluck a stray number out of a sentence — a 0 price is flagged as missing so the
+    user fixes it, which is safer than guessing a dimension as the price."""
+    if x is None or isinstance(x, bool):
+        return default
+    if isinstance(x, (int, float)):
+        try:
+            return default if pd.isna(x) else float(x)
+        except (TypeError, ValueError):
+            return default
+    s = str(x).strip().replace(",", "")
+    for tok in ("AED", "aed", "Aed", "$", "USD", "usd"):
+        s = s.replace(tok, "")
+    s = s.strip()
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return default
+
+
 def _prefill(field: dict, draft: dict, opt: dict):
     """Pre-fill a field from sources, then coerce to the schema's value type."""
     return _coerce_field_value(field, _prefill_value(field, draft, opt))
@@ -1210,8 +1233,7 @@ def _prefill_value(field: dict, draft: dict, opt: dict):
     if src == "brand":
         return draft.get("brand", "")
     if src == "price":
-        p = draft.get("price")
-        return float(p) if p not in (None, "", 0) and not pd.isna(p) else 0.0
+        return _num(draft.get("price"))
     if src == "image":
         imgs = draft.get("images") or []
         return imgs[0] if imgs else ""
@@ -1306,12 +1328,6 @@ def _parse_pricelist_bytes(data: bytes, is_csv: bool) -> pd.DataFrame:
                       "carton": 10, "media": 11}
         colmap = {k: v for k, v in positional.items() if v < ncols}
         hidx = -1
-    price_col = colmap.get("price_rrp")  # user chose RRP
-    if price_col is None:
-        price_col = colmap.get("price_mrp")
-    if price_col is None:
-        price_col = colmap.get("price_base")
-
     def cell_at(ri, ci):
         if ci is None:
             return ""
@@ -1320,6 +1336,43 @@ def _parse_pricelist_bytes(data: bytes, is_csv: bool) -> pd.DataFrame:
 
     def cell(ri, key):
         return cell_at(ri, colmap.get(key))
+
+    # --- PRICE column selection, VALUE-VALIDATED -------------------------------
+    # Pick the price column by the user's preference (RRP → MRP → base), but ONLY if
+    # it actually holds numbers. Header/positional guesses can land on a specs/carton
+    # column (e.g. 'Dimensions… Gross Weight… Quantity'), so if the preferred price
+    # columns aren't numeric we find the real numeric price column from the data.
+    _data_rows = list(range(hidx + 1, len(raw)))
+
+    def _num_ratio(ci):
+        if ci is None:
+            return 0.0
+        vals = [cell_at(ri, ci) for ri in _data_rows]
+        vals = [v for v in vals if v]
+        return (sum(1 for v in vals if _num(v, 0) > 0) / len(vals)) if vals else 0.0
+
+    pref_price = [colmap[k] for k in ("price_rrp", "price_mrp", "price_base")
+                  if colmap.get(k) is not None]
+    price_cols = [ci for ci in pref_price if _num_ratio(ci) >= 0.5]
+    if not price_cols:
+        # No usable mapped price column → find numeric columns that aren't an
+        # id/text/specs column, and take the RIGHT-MOST (RRP sits toward the right
+        # in these price lists). This recovers the price even when the header row
+        # wasn't detected and the positional guess pointed at the wrong column.
+        non_price = {colmap.get(k) for k in ("sku", "barcode", "media", "image",
+                     "feature", "title", "color", "carton")
+                     if colmap.get(k) is not None}
+        numeric = [ci for ci in range(raw.shape[1])
+                   if ci not in non_price and _num_ratio(ci) >= 0.6]
+        if numeric:
+            price_cols = [max(numeric)]
+
+    def _row_price(ri):
+        for pc in price_cols:
+            v = cell_at(ri, pc)
+            if _num(v, 0) > 0:
+                return v
+        return ""
 
     def hyperlink(ri, key):
         ci = colmap.get(key)
@@ -1348,7 +1401,7 @@ def _parse_pricelist_bytes(data: bytes, is_csv: bool) -> pd.DataFrame:
             image = ""
         rows.append({
             "sku": sku, "title": title, "feature": cell(ri, "feature"),
-            "color": cell(ri, "color"), "price": cell_at(ri, price_col),
+            "color": cell(ri, "color"), "price": _row_price(ri),
             "barcode": barcode, "media": media, "image": image,
             "carton": cell(ri, "carton"), "_row": ri,
         })
@@ -2300,9 +2353,13 @@ def _push_one(sku: str, pt: str, attributes: dict, images: list, use_mock: bool)
             res["listing_status"] = conf.get("status", "")
             if res.get("status") == "submitted":
                 res["status"] = "ok"   # confirmed created → upgrade from 'submitted'
+        # 'listed' ONLY when Amazon confirmed an ASIN; otherwise it's still pending
+        # (submitted but unconfirmed) — don't mislabel it as created.
+        _created = bool(res.get("asin"))
         db.upsert_catalog_item(sku=sku, asin=res.get("asin", ""),
                                title=attributes.get("item_name", ""),
-                               brand=attributes.get("brand", ""), category=pt, status="listed")
+                               brand=attributes.get("brand", ""), category=pt,
+                               status="listed" if _created else "pending")
         db.add_ready_to_list(sku, attributes.get("item_name", ""),
                              float(attributes.get("standard_price") or 0), images,
                              {"product_type": pt, "attributes": attributes})
@@ -2603,10 +2660,12 @@ def _auto_creation_tab() -> None:
                                 if not use_mock else {"asin": "MOCK-ASIN", "status": "MOCK"})
                         if conf.get("asin"):
                             confirmed_asins[p["sku"]] = conf
+                        # 'listed' ONLY when Amazon confirmed an ASIN — an unconfirmed
+                        # 'submitted' item stays 'pending' so it isn't shown as created.
                         db.upsert_catalog_item(sku=p["sku"], asin=conf.get("asin", ""),
                                                title=p["attrs"].get("item_name", ""),
                                                brand=p["attrs"].get("brand", ""), category=p["pt"],
-                                               status="listed")
+                                               status="listed" if conf.get("asin") else "pending")
                         db.add_ready_to_list(p["sku"], p["attrs"].get("item_name", ""),
                                              float(p["attrs"].get("standard_price") or 0),
                                              p["draft"].get("images", []),
@@ -2763,7 +2822,7 @@ def _auto_creation_tab() -> None:
                                            key=key)
                     elif f["type"] == "number":
                         val = st.number_input(
-                            label, value=float(prefill or f.get("default", 0) or 0), key=key)
+                            label, value=_num(prefill, _num(f.get("default", 0))), key=key)
                     elif f["type"] == "textarea":
                         val = st.text_area(label, value=str(prefill or ""), height=90, key=key)
                     else:
@@ -2982,13 +3041,130 @@ def _auto_creation_tab() -> None:
     st.markdown(section_label("📦 Submitted / Ready-to-List"), unsafe_allow_html=True)
     ready = db.get_ready_to_list()
     if ready:
-        qdf = pd.DataFrame([{"SKU": r["sku"], "Title": r["title"],
-                             "Price": f"AED {r['price']:,.0f}",
-                             "Type": (r["payload"].get("product_type", "—")
-                                      if isinstance(r["payload"], dict) else "—")}
-                            for r in ready])
-        styled_table(qdf, highlight={"row-good": lambda r: True})
+        def _when(r):
+            ldt = _created_local(r.get("created_at"))
+            return ldt.strftime("%Y-%m-%d %H:%M") if ldt else (r.get("created_at") or "—")
+
+        def _is_created(r) -> bool:
+            # Truth = Amazon gave it a real ASIN. No ASIN → submitted but not created.
+            asin = str(r.get("asin") or "").strip()
+            return bool(asin) and asin.upper() not in ("PENDING", "")
+
+        uncreated = [r for r in ready if not _is_created(r)]
+        n_ok = len(ready) - len(uncreated)
+        # Per-SKU issues + live Amazon status from the last health-check.
+        issues_map = st.session_state.get("aic_issues", {})
+        status_map = st.session_state.get("aic_status_map", {})
+
+        def _issue_cell(sku):
+            if sku not in issues_map:
+                return "— (not checked)"
+            iss = issues_map[sku]
+            if not iss:
+                return "✓ complete"
+            errs = sum(1 for i in iss if i.get("severity") == "ERROR")
+            warns = len(iss) - errs
+            return f"⚠ {len(iss)} ({errs} block / {warns} info)" if errs else f"⚠ {warns} missing"
+
+        def _status_cell(r):
+            # Prefer the real Amazon status from a health-check; else the local
+            # created/not-confirmed signal until one has been run.
+            s = status_map.get(r["sku"])
+            if s:
+                return s
+            return "Created" if _is_created(r) else "Not confirmed"
+
+        def _status_kind(s: str) -> str:
+            t = s.lower()
+            if "active" in t or t == "created":
+                return "green"
+            if any(w in t for w in ("suppress", "missing information", "removed", "failed")):
+                return "coral"
+            return "amber"   # out of stock / missing offer / inactive / not confirmed
+
+        st.caption(f"✅ {n_ok} confirmed created · ⏳ {len(uncreated)} not confirmed. "
+                   f"Run the health-check to fill **Status** with Amazon's real state "
+                   f"(Active / Out of stock / Missing offer / Missing information / "
+                   f"Search suppressed) and the **Issues** column.")
+
+        rows_data = [{
+            "Created": _when(r), "SKU": r["sku"], "Title": r["title"],
+            "Price": f"AED {r['price']:,.0f}",
+            "Type": (r["payload"].get("product_type", "—")
+                     if isinstance(r["payload"], dict) else "—"),
+            "ASIN": (str(r.get("asin") or "").strip() or "—"),
+            "Status": _status_cell(r),
+            "Issues": _issue_cell(r["sku"])}
+            for r in ready]
+        qdf = pd.DataFrame(rows_data)
+        # Build a colour for each distinct Status value present.
+        status_badges = {s: (s, _status_kind(s)) for s in {row["Status"] for row in rows_data}}
+        # highlight predicates receive the DataFrame row → key off the Status column.
+        styled_table(qdf, highlight={
+            "row-good": lambda row: _status_kind(row["Status"]) == "green"
+            and not str(row["Issues"]).startswith("⚠"),
+            "row-warn": lambda row: _status_kind(row["Status"]) != "green"
+            or str(row["Issues"]).startswith("⚠")},
+            badge_cols={"Status": status_badges})
         export_buttons(qdf, "ready_to_list")
+
+        # ── Health check: ask Amazon what each listing is missing, fix status ──
+        bc1, bc2 = st.columns(2)
+        if bc1.button("🩺 Re-check & health-check ALL on Amazon", use_container_width=True,
+                      help="Re-confirm each SKU and pull Amazon's missing/incomplete-info issues."):
+            new_issues, new_status, promoted = {}, {}, 0
+            seen = []
+            with st.spinner("Asking Amazon for each listing's status & issues…"):
+                for r in ready:
+                    sku = r["sku"]
+                    if sku in seen:
+                        continue
+                    seen.append(sku)
+                    try:
+                        info = client().confirm_listing(sku)
+                    except Exception as e:
+                        info = {"exists": False, "amazon_status": "Check failed",
+                                "all_issues": [{"severity": "ERROR",
+                                "message": f"check failed: {e}", "attributes": []}]}
+                    if info.get("exists") and info.get("asin"):
+                        db.upsert_catalog_item(
+                            sku=sku, asin=info["asin"], title=r.get("title", ""),
+                            category=(r["payload"].get("product_type", "")
+                                      if isinstance(r["payload"], dict) else ""),
+                            status="listed")
+                        promoted += 1
+                    new_issues[sku] = info.get("all_issues", [])
+                    new_status[sku] = (info.get("amazon_status")
+                                       or ("Not on Amazon" if not info.get("exists") else ""))
+            st.session_state["aic_issues"] = new_issues
+            st.session_state["aic_status_map"] = new_status
+            incomplete = sum(1 for v in new_issues.values() if v)
+            st.success(f"Health-check done — {promoted} confirmed created, "
+                       f"{incomplete} listing(s) missing/incomplete info (see below).")
+            st.rerun()
+        if uncreated and bc2.button(f"🗑️ Remove {len(uncreated)} not-created from list",
+                                    use_container_width=True):
+            n = db.delete_ready_to_list([r["sku"] for r in uncreated])
+            st.session_state.pop("aic_issues", None)
+            st.session_state.pop("aic_status_map", None)
+            st.success(f"Removed {n} not-created entr(y/ies).")
+            st.rerun()
+
+        # ── Per-SKU "what's missing" detail, straight from Amazon ──
+        flagged = {s: v for s, v in issues_map.items() if v}
+        if flagged:
+            st.markdown(alert(
+                f"{len(flagged)} listing(s) are live but missing/incomplete info on Amazon. "
+                "Open the editor above, fill the named field(s), and push again.",
+                kind="amber", icon="⚠️"), unsafe_allow_html=True)
+            with st.expander(f"⚠️ What's missing on {len(flagged)} listing(s)", expanded=True):
+                for sku, iss in flagged.items():
+                    st.markdown(f"**{sku}**")
+                    for i in iss:
+                        attrs = ", ".join(i.get("attributes") or [])
+                        sev = "⛔" if i.get("severity") == "ERROR" else "⚠"
+                        st.markdown(f"- {sev} {i.get('message', '')}"
+                                    + (f"  _(field: `{attrs}`)_" if attrs else ""))
     else:
         st.caption("Nothing pushed yet.")
 

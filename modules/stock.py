@@ -5,18 +5,19 @@ modules/stock.py
 
   * Upload TWO files: Amazon inventory + Warehouse inventory.
   * Match items across both (SKU/ASIN/barcode, with fuzzy title fallback).
-  * Apply per-brand / per-category min-stock rules from Stock Configuration.
+  * Apply per-brand / per-category min-stock rules from the Update Stock tab.
   * Output: Out-of-Stock / below-threshold list (table + Export) and fire
     notifications for out-of-stock items.
 
-Sub-tab "Stock Configuration" persists thresholds to the DB.
+Sub-tab "Update Stock" persists min-stock thresholds to the DB.
 """
 
 from __future__ import annotations
+import re
 import pandas as pd
 import streamlit as st
 
-from core import db, notifier
+from core import db, notifier, oskar_source
 from core.util import get_field, fuzzy_match_key
 from core.components import styled_table, export_buttons, page_header
 from core.styles import section_label, badge, alert
@@ -130,33 +131,155 @@ def _match_tab() -> None:
                     (st.success if ok else st.warning)(f"{ch}: {msg}")
 
 
-def _config_tab() -> None:
-    st.markdown(section_label("Stock Configuration — min thresholds"), unsafe_allow_html=True)
-    st.caption("Brand rule overrides category rule, which overrides the global default (10).")
+def _read_upload(f):
+    """Read an uploaded CSV/Excel into a DataFrame (None if nothing uploaded)."""
+    if f is None:
+        return None
+    return pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
 
-    c1, c2, c3, c4 = st.columns([1.2, 2, 1, 1])
-    scope = c1.selectbox("Scope", ["brand", "category"])
-    value = c2.text_input("Value (e.g. Apple / Audio)")
-    minv = c3.number_input("Min stock", min_value=0, value=15)
-    with c4:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        if st.button("💾 Save rule", use_container_width=True) and value:
-            db.set_stock_rule(scope, value, int(minv))
-            st.success(f"Saved {scope} rule: {value} ≥ {minv}")
-            st.rerun()
 
-    rules = db.get_stock_rules()
-    if rules:
-        styled_table(pd.DataFrame(rules)[["scope_type", "scope_value", "min_stock"]])
-    else:
-        st.caption("No custom rules yet — global default of 10 applies.")
+def _clean_flex_sku(value) -> str:
+    """Base SKU = everything BEFORE the first '#'. Drops the '#' and anything after
+    it (e.g. 'PWFC1029BWH#FBA1' → 'PWFC1029BWH', 'ABC#' → 'ABC')."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).split("#", 1)[0].strip()
+
+
+def _find_sku_cols(df):
+    """ALL SKU-type columns (Sku, Msku, Seller SKU, …) — anything whose header
+    contains 'sku'. The '#FBA' suffix can live on any of them, so we clean them all."""
+    return [c for c in df.columns if "sku" in re.sub(r"[^a-z0-9]", "", str(c).lower())]
+
+
+def _connect_sku_col(sku_cols):
+    """Which SKU column to look up on connect: prefer the MERCHANT SKU (Msku), since
+    that's the product code connect knows — not Amazon's internal X00… SKU."""
+    for c in sku_cols:
+        n = re.sub(r"[^a-z0-9]", "", str(c).lower())
+        if "msku" in n or "merchant" in n:
+            return c
+    return sku_cols[0] if sku_cols else None
+
+
+def _find_sellable_col(df):
+    """Locate the SELLABLE-stock column. Prefers an explicit 'sellable' header, then
+    common Amazon/FBA names (afn-fulfillable-quantity, available, fulfillable)."""
+    def norm(c):
+        return re.sub(r"[^a-z0-9]", "", str(c).lower())
+    cols = list(df.columns)
+    for c in cols:                                   # explicit 'sellable'
+        if "sellable" in norm(c):
+            return c
+    for key in ("afnfulfillablequantity", "fulfillablequantity", "fulfillable",
+                "availablequantity", "quantityavailable", "available"):
+        for c in cols:
+            if key in norm(c):
+                return c
+    return None
+
+
+def _flatten_scalars(d: dict, prefix: str = "") -> dict:
+    """Flatten a connect record to columns: nested objects (e.g. 'product', 'media')
+    are dotted (product.brand), lists become a '<key>_count'. Captures ALL the info
+    connect returns without exploding huge lists like assets/images into the table."""
+    out = {}
+    for k, v in (d or {}).items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flatten_scalars(v, prefix=key + "."))
+        elif isinstance(v, list):
+            out[f"{key}_count"] = len(v)
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            out[key] = v
+    return out
+
+
+def _update_stock_tab() -> None:
+    st.markdown(section_label("Update Stock — Flex inventory + connect enrichment"),
+                unsafe_allow_html=True)
+
+    flex_file = st.file_uploader("Flex inventory (CSV/Excel)", type=["csv", "xlsx"],
+                                 key="stk_flex")
+    flex = _read_upload(flex_file)
+    if flex is None:
+        st.caption("Upload your Flex inventory Excel to begin.")
+        return
+
+    sku_cols = _find_sku_cols(flex)
+    if not sku_cols:
+        st.warning("Couldn't find a SKU column in the Flex file. Columns found: "
+                   + ", ".join(map(str, flex.columns)))
+        return
+
+    # ── Clean EVERY SKU column: drop '#' and everything after it ──────────────
+    out = flex.copy()
+    total_rows = len(out)
+    n_changed = 0
+    for col in sku_cols:
+        before = out[col].astype(str)
+        out[col] = out[col].map(_clean_flex_sku)
+        n_changed += int((before != out[col].astype(str)).sum())
+
+    # ── Remove rows with 0 sellable stock ─────────────────────────────────────
+    sell_col = _find_sellable_col(out)
+    removed_zero = 0
+    if sell_col is not None:
+        qty = pd.to_numeric(out[sell_col], errors="coerce").fillna(0)
+        removed_zero = int((qty <= 0).sum())
+        out = out[qty > 0].copy()
+
+    st.markdown(section_label("Flex inventory — cleaned"), unsafe_allow_html=True)
+    msg = (f"Cleaned SKU column(s) **{', '.join(map(str, sku_cols))}** — removed '#' and "
+           f"everything after it ({n_changed} cell(s) changed).")
+    if sell_col is not None:
+        msg += (f" Dropped **{removed_zero}** row(s) with 0 sellable stock "
+                f"(column **{sell_col}**) — **{len(out)}** of {total_rows} rows kept.")
+    st.caption(msg)
+    if sell_col is None:
+        st.warning("Couldn't find a 'sellable' stock column, so no 0-stock rows were "
+                   "removed. Columns found: " + ", ".join(map(str, out.columns)))
+    st.dataframe(out, use_container_width=True, hide_index=True)
+    export_buttons(out, "flex_inventory_cleaned")
+    st.session_state["flex_cleaned"] = out
+
+    # ── Pull ALL info for each SKU from connect.oskarme.com ───────────────────
+    st.markdown(section_label("Get all info from connect"), unsafe_allow_html=True)
+    connect_col = _connect_sku_col(sku_cols)
+    st.caption(f"Looking up connect by **{connect_col}** (merchant SKU).")
+    skus = [s for s in dict.fromkeys(out[connect_col].astype(str).tolist()) if s.strip()]
+    if db.get_setting("use_mock_oskar", "1") == "1":
+        st.info("MOCK enrichment is ON (Settings → Connections → 'Use MOCK enrichment'). "
+                "Turn it OFF to pull real connect.oskarme.com data.")
+    if st.button(f"🔗 Get all info from connect for {len(skus)} SKU(s)",
+                 use_container_width=True, type="primary"):
+        rows, prog = [], st.progress(0.0)
+        with st.spinner("Fetching product info from connect.oskarme.com…"):
+            for i, sku in enumerate(skus):
+                info = oskar_source.fetch_product_info(sku)
+                row = {"SKU": sku, "Found": "✓" if info.get("ok") else "✗",
+                       "Images": len(info.get("images") or [])}
+                row.update(_flatten_scalars(info.get("data")))
+                if not info.get("ok") and info.get("reason"):
+                    row["Note"] = info["reason"]
+                rows.append(row)
+                prog.progress((i + 1) / max(len(skus), 1))
+        st.session_state["flex_connect_info"] = pd.DataFrame(rows)
+        st.rerun()
+
+    enriched = st.session_state.get("flex_connect_info")
+    if enriched is not None and not enriched.empty:
+        found = int((enriched.get("Found") == "✓").sum()) if "Found" in enriched else 0
+        st.caption(f"connect returned info for {found} of {len(enriched)} SKU(s).")
+        st.dataframe(enriched, use_container_width=True, hide_index=True)
+        export_buttons(enriched, "flex_connect_info")
 
 
 def render(nav=None) -> None:
     page_header("Stock Management",
                 "Match Amazon vs warehouse and surface every stock-out", icon="📦")
-    t1, t2 = st.tabs(["🔍 Match & Out-of-Stock", "⚙️ Stock Configuration"])
+    t1, t2 = st.tabs(["🔍 Match & Out-of-Stock", "📝 Update Stock"])
     with t1:
         _match_tab()
     with t2:
-        _config_tab()
+        _update_stock_tab()

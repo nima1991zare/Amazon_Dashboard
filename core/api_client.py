@@ -113,13 +113,15 @@ class ApiClient:
         """Directly confirm whether a listing was created (getListingsItem).
         Returns {exists, status, asin, issues}. Mock returns a stub."""
         if self.use_mock:
-            return {"exists": True, "status": "MOCK_DISCOVERABLE",
-                    "asin": "MOCK-ASIN", "issues": []}
+            return {"exists": True, "status": "BUYABLE, DISCOVERABLE",
+                    "amazon_status": "Active", "status_list": ["BUYABLE", "DISCOVERABLE"],
+                    "asin": "MOCK-ASIN", "issues": [], "all_issues": []}
         try:
             from core import sp_api
             return sp_api.get_listing_status(sku)
         except Exception as e:
-            return {"exists": False, "status": "", "asin": "", "issues": [str(e)]}
+            return {"exists": False, "status": "", "amazon_status": "Check failed",
+                    "status_list": [], "asin": "", "issues": [str(e)], "all_issues": []}
 
     def push_listings_feed(self, items: list) -> dict:
         """Batch submit many listings in ONE JSON_LISTINGS_FEED."""
