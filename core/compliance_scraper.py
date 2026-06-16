@@ -108,6 +108,24 @@ def _launch(pw, headless: bool):
     raise RuntimeError("no browser could launch (" + " | ".join(errs) + ")")
 
 
+def _fresh_page(ctx):
+    """A single clean foreground tab. Persistent Chrome profiles restore old tabs
+    (incl. about:blank), which confuses the user and can target the wrong page — so
+    open a fresh page, close every other tab, and bring it to front."""
+    page = ctx.new_page()
+    for p in list(ctx.pages):
+        if p is not page:
+            try:
+                p.close()
+            except Exception:
+                pass
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    return page
+
+
 def _rows_from_json(data) -> list:
     """Largest list-of-dicts anywhere in `data` whose dicts carry an ASIN-like key."""
     best = []
@@ -157,7 +175,7 @@ def _run_login():
         from playwright.sync_api import sync_playwright
         with sync_playwright() as pw:
             ctx = _launch(pw, headless=False)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page = _fresh_page(ctx)
             try:
                 page.goto(SIGNIN_HOME, timeout=60000)
             except Exception:
@@ -226,7 +244,7 @@ def _fetch_once(headless: bool) -> dict:
 
     with sync_playwright() as pw:
         ctx = _launch(pw, headless=headless)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page = _fresh_page(ctx)
         page.on("response", on_response)
         try:
             page.goto(COMPLIANCE_URL, wait_until="networkidle", timeout=90000)
@@ -298,7 +316,7 @@ def _run_upload(asin: str, file_path: str):
         from playwright.sync_api import sync_playwright
         with sync_playwright() as pw:
             ctx = _launch(pw, headless=False)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page = _fresh_page(ctx)
             try:
                 page.goto(COMPLIANCE_URL, wait_until="networkidle", timeout=90000)
             except Exception:

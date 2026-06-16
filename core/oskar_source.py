@@ -190,10 +190,11 @@ def _fetch_stock_one(sess, base: str, token: str, sku: str, timeout: int = 30) -
         if match is None and len(data) == 1:   # single result → take it
             match = data[0]
         if match is None:
-            return {"ok": True, "sku": sku, "qty": "", "reason": "no exact SKU match"}
-        return {"ok": True, "sku": sku, "qty": match.get("qty", ""), "reason": ""}
+            return {"ok": True, "sku": sku, "qty": "", "brand": "", "reason": "no exact SKU match"}
+        return {"ok": True, "sku": sku, "qty": match.get("qty", ""),
+                "brand": match.get("brand", ""), "reason": ""}
     except Exception as e:
-        return {"ok": False, "sku": sku, "qty": "", "reason": f"connect error: {e}"}
+        return {"ok": False, "sku": sku, "qty": "", "brand": "", "reason": f"connect error: {e}"}
 
 
 def fetch_stock_bulk(skus, max_workers: int = 12, timeout: int = 30) -> dict:
@@ -205,7 +206,8 @@ def fetch_stock_bulk(skus, max_workers: int = 12, timeout: int = 30) -> dict:
         return out
     if _use_mock():
         # mock: derive a stable pseudo-qty so the column isn't empty in demo mode
-        return {s: {"ok": True, "sku": s, "qty": (abs(hash(s)) % 200) + 1, "reason": ""}
+        return {s: {"ok": True, "sku": s, "qty": (abs(hash(s)) % 200) + 1,
+                    "brand": "MockBrand", "reason": ""}
                 for s in skus}
     base = (db.get_setting("oskar_base_url", "https://connect.oskarme.com") or
             "https://connect.oskarme.com").rstrip("/")

@@ -345,33 +345,62 @@ def _update_stock_tab() -> None:
                 st.caption("If that's a timeout/connection error, this machine can't reach "
                            "connect.oskarme.com — check your network/VPN and the oskar token "
                            "in Settings, then retry.")
-    if st.button(f"🔗 Get Southbay stock from connect for {len(mskus)} Msku(s)",
+    if st.button(f"🔗 Get Southbay stock + brand from connect for {len(mskus)} Msku(s)",
                  use_container_width=True, type="primary"):
         cache = st.session_state.setdefault("connect_sb_cache", {})
         todo = [m for m in mskus if m not in cache]          # only fetch new ones
         if todo:
-            with st.spinner(f"Fetching Southbay stock for {len(todo)} Msku(s) from connect "
+            with st.spinner(f"Fetching stock + brand for {len(todo)} Msku(s) from connect "
                             f"(parallel)…"):
                 results = oskar_source.fetch_stock_bulk(todo, max_workers=16)
             for m in todo:
                 info = results.get(m, {})
-                cache[m] = info.get("qty", "") if info.get("ok") else ""
-        st.session_state["flex_southbay_map"] = {m: cache.get(m, "") for m in mskus}
+                cache[m] = ({"qty": info.get("qty", ""), "brand": info.get("brand", "")}
+                            if info.get("ok") else {"qty": "", "brand": ""})
+        st.session_state["flex_southbay_map"] = {m: cache.get(m, {}) for m in mskus}
         st.rerun()
 
     sb_map = st.session_state.get("flex_southbay_map")
     if sb_map:
+        def _g(m, key):                                     # tolerate old scalar cache too
+            v = sb_map.get(m, {})
+            if isinstance(v, dict):
+                return v.get(key, "")
+            return v if key == "qty" else ""
+
         final = reduced.copy()
-        final["Southbay Stock"] = final["Msku"].astype(str).map(
-            lambda m: sb_map.get(m, ""))
-        with_sb = int((final["Southbay Stock"].astype(str).str.strip() != "").sum())
-        st.caption(f"Southbay stock returned for {with_sb} of {len(final)} rows "
-                   f"(cached — re-runs are instant).")
-        if with_sb == 0:
-            st.warning("connect returned no stock for any Msku. Use the 🔬 diagnostic above to "
-                       "check connect is reachable and the Msku matches a product.")
-        st.dataframe(final, use_container_width=True, hide_index=True)
-        export_buttons(final, "flex_stock_with_southbay")
+        final["Brand"] = final["Msku"].astype(str).map(lambda m: _g(m, "brand"))
+        final["Southbay Stock"] = final["Msku"].astype(str).map(lambda m: _g(m, "qty"))
+
+        st.caption("Rows missing **Brand** or **Southbay Stock** (connect had no match) are "
+                   "flagged below — edit the **Brand** / **Southbay Stock** cells right in the "
+                   "table to fix them, then export.")
+        # Editable table — only Brand + Southbay Stock are editable; rest are locked.
+        edited = st.data_editor(
+            final, key="flex_stock_editor", use_container_width=True, hide_index=True,
+            disabled=[c for c in final.columns if c not in ("Brand", "Southbay Stock")])
+
+        def _blank(col):
+            return edited[col].astype(str).str.strip().isin(["", "nan", "None"])
+        miss_mask = _blank("Brand") | _blank("Southbay Stock")
+        missing = edited[miss_mask]
+        if len(missing):
+            st.markdown(alert(
+                f"{len(missing)} SKU(s) are missing stock and/or brand — fix them in the table "
+                "above (Brand / Southbay Stock columns).", kind="amber", icon="⚠️"),
+                unsafe_allow_html=True)
+            err = missing.copy()
+            err["Missing"] = err.apply(
+                lambda r: ", ".join(
+                    ([] if str(r["Brand"]).strip() not in ("", "nan", "None") else ["brand"])
+                    + ([] if str(r["Southbay Stock"]).strip() not in ("", "nan", "None") else ["stock"])),
+                axis=1)
+            styled_table(err[["SKU", "Msku", "Brand", "Southbay Stock", "Missing"]],
+                         highlight={"row-danger": lambda r: True})
+        else:
+            st.markdown(alert("All SKUs have a brand and stock value. ✓", kind="green",
+                              icon="✅"), unsafe_allow_html=True)
+        export_buttons(edited, "flex_stock_with_southbay")
 
 
 def render(nav=None) -> None:
