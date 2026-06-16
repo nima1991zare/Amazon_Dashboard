@@ -217,6 +217,34 @@ def search_catalog_items(identifier: str, id_type: str = "GTIN") -> list[dict]:
     return r.json().get("items", [])
 
 
+def get_item_by_asin(asin: str) -> dict:
+    """Fetch one ASIN's catalog record (Catalog Items 2022-04-01 getCatalogItem).
+    Returns {ok, asin, title, brand, product_type, attributes, reason}. `attributes`
+    is Amazon's catalog attribute dict (may carry battery info when present)."""
+    import requests
+    asin = str(asin).strip().upper()
+    if not asin:
+        return {"ok": False, "asin": asin, "reason": "empty ASIN"}
+    c = creds()
+    try:
+        r = _http("get", f"{c['endpoint']}/catalog/2022-04-01/items/{asin}",
+                  params={"marketplaceIds": c["marketplace_id"],
+                          "includedData": "summaries,attributes,productTypes"},
+                  headers=_headers(), timeout=20)
+        if r.status_code == 404:
+            return {"ok": False, "asin": asin, "reason": "ASIN not found in this marketplace"}
+        r.raise_for_status()
+        j = r.json()
+        summ = (j.get("summaries") or [{}])[0]
+        pts = j.get("productTypes") or [{}]
+        return {"ok": True, "asin": asin,
+                "title": summ.get("itemName", ""), "brand": summ.get("brand", ""),
+                "product_type": (pts[0].get("productType") if pts else "") or "",
+                "attributes": j.get("attributes", {}) or {}, "reason": ""}
+    except Exception as e:
+        return {"ok": False, "asin": asin, "reason": f"lookup error: {e}"}
+
+
 def _derive_amazon_status(statuses: set, all_issues: list, offers_present: bool,
                           qty) -> str:
     """Map raw SP-API signals to the seller-facing status the user sees in Seller

@@ -125,6 +125,23 @@ def init_db() -> None:
                 status     TEXT,           -- 'add stock' | 'done'
                 updated_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS hazmat_status (
+                asin       TEXT PRIMARY KEY,
+                title      TEXT,
+                status     TEXT,           -- raw status (first line)
+                bucket     TEXT,           -- fulfillable | unable | unfulfillable | other
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS hazmat_status_changes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                changed_at TEXT,
+                asin       TEXT,
+                title      TEXT,
+                old_status TEXT,
+                new_status TEXT
+            );
             """
         )
 
@@ -348,6 +365,49 @@ def get_ready_to_list() -> list[dict]:
         d["payload"] = json.loads(d["payload"]) if d["payload"] else {}
         out.append(d)
     return out
+
+
+def save_hazmat_statuses(items: list) -> list:
+    """Persist the latest hazmat status per ASIN and return the CHANGES vs what was
+    stored. `items` = [{asin, title, status, bucket}]. A change is logged when the
+    bucket (the meaningful classification) differs from the stored one. Returns
+    [{asin, title, old_status, new_status, changed_at}], newest first."""
+    changes = []
+    now = _now()
+    with _conn() as c:
+        prev = {r["asin"]: dict(r) for r in
+                c.execute("SELECT asin, status, bucket FROM hazmat_status").fetchall()}
+        for it in items or []:
+            asin = str(it.get("asin") or "").strip()
+            if not asin:
+                continue
+            status = str(it.get("status") or "").strip()
+            bucket = str(it.get("bucket") or "").strip()
+            title = str(it.get("title") or "")
+            old = prev.get(asin)
+            if old is not None and old.get("bucket") != bucket:
+                c.execute("INSERT INTO hazmat_status_changes"
+                          "(changed_at, asin, title, old_status, new_status) VALUES(?,?,?,?,?)",
+                          (now, asin, title, old.get("status", ""), status))
+                changes.append({"asin": asin, "title": title,
+                                "old_status": old.get("status", ""), "new_status": status,
+                                "changed_at": now})
+            c.execute(
+                "INSERT INTO hazmat_status(asin,title,status,bucket,updated_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(asin) DO UPDATE SET "
+                "title=excluded.title, status=excluded.status, bucket=excluded.bucket, "
+                "updated_at=excluded.updated_at",
+                (asin, title, status, bucket, now))
+    return changes
+
+
+def get_hazmat_changes(limit: int = 200) -> list:
+    """Recent hazmat status changes, newest first."""
+    with _conn() as c:
+        rows = c.execute("SELECT changed_at, asin, title, old_status, new_status "
+                         "FROM hazmat_status_changes ORDER BY id DESC LIMIT ?",
+                         (int(limit),)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def delete_ready_to_list(skus) -> int:
