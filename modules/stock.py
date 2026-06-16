@@ -179,6 +179,67 @@ def _find_sellable_col(df):
     return None
 
 
+def _pick_col(df, *rules):
+    """First column whose normalized name matches a rule. Each rule = (include,
+    exclude_or_None): include substring must be present, exclude (if given) absent.
+    Used to tell 'Sku' apart from 'Msku' (both contain 'sku')."""
+    def n(c):
+        return re.sub(r"[^a-z0-9]", "", str(c).lower())
+    for inc, exc in rules:
+        for c in df.columns:
+            nm = n(c)
+            if inc in nm and (exc is None or exc not in nm):
+                return c
+    return None
+
+
+def _southbay_value(data):
+    """Find the 'Southbay' stock quantity anywhere in a connect product record.
+    Handles {southbayStock: 12}, {warehouses:{southbay:{stock:12}}}, and
+    [{name:'Southbay', quantity:12}, …]. Returns the value, or '' if not present."""
+    def n(s):
+        return re.sub(r"[^a-z0-9]", "", str(s).lower())
+    qty_keys = ("stock", "quantity", "qty", "available", "sellable", "onhand",
+                "count", "value", "balance", "inventory")
+
+    def qty_from(v):
+        if isinstance(v, (int, float)):
+            return v
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            for k, val in v.items():
+                if any(q in n(k) for q in qty_keys) and isinstance(val, (int, float, str)):
+                    return val
+        return None
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if "southbay" in n(k):
+                    r = qty_from(v)
+                    if r is not None:
+                        return r
+                r = walk(v)
+                if r is not None:
+                    return r
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    names = " ".join(str(x) for x in item.values() if isinstance(x, str))
+                    if "southbay" in n(names):
+                        for k, val in item.items():
+                            if any(q in n(k) for q in qty_keys) and isinstance(val, (int, float, str)):
+                                return val
+                r = walk(item)
+                if r is not None:
+                    return r
+        return None
+
+    r = walk(data or {})
+    return r if r is not None else ""
+
+
 def _flatten_scalars(d: dict, prefix: str = "") -> dict:
     """Flatten a connect record to columns: nested objects (e.g. 'product', 'media')
     are dotted (product.brand), lists become a '<key>_count'. Captures ALL the info
@@ -229,50 +290,88 @@ def _update_stock_tab() -> None:
         removed_zero = int((qty <= 0).sum())
         out = out[qty > 0].copy()
 
+    # ── Keep ONLY SKU / Msku / ASIN / Sellable ────────────────────────────────
+    sku_col = _pick_col(out, ("sku", "msku"), ("sellersku", "msku"))
+    msku_col = _pick_col(out, ("msku", None), ("merchant", None))
+    asin_col = _pick_col(out, ("asin", None))
+    keep = [("SKU", sku_col), ("Msku", msku_col), ("ASIN", asin_col), ("Sellable", sell_col)]
+    reduced = pd.DataFrame({label: (out[col].values if col is not None else [""] * len(out))
+                            for label, col in keep})
+
     st.markdown(section_label("Flex inventory — cleaned"), unsafe_allow_html=True)
-    msg = (f"Cleaned SKU column(s) **{', '.join(map(str, sku_cols))}** — removed '#' and "
-           f"everything after it ({n_changed} cell(s) changed).")
+    msg = (f"Cleaned SKU column(s) **{', '.join(map(str, sku_cols))}** (removed '#'… , "
+           f"{n_changed} cells). Kept only SKU / Msku / ASIN / Sellable.")
     if sell_col is not None:
-        msg += (f" Dropped **{removed_zero}** row(s) with 0 sellable stock "
-                f"(column **{sell_col}**) — **{len(out)}** of {total_rows} rows kept.")
+        msg += (f" Dropped **{removed_zero}** row(s) with 0 sellable stock — "
+                f"**{len(out)}** of {total_rows} rows kept.")
     st.caption(msg)
     if sell_col is None:
-        st.warning("Couldn't find a 'sellable' stock column, so no 0-stock rows were "
-                   "removed. Columns found: " + ", ".join(map(str, out.columns)))
-    st.dataframe(out, use_container_width=True, hide_index=True)
-    export_buttons(out, "flex_inventory_cleaned")
-    st.session_state["flex_cleaned"] = out
+        st.warning("Couldn't find a 'sellable' column, so 0-stock rows were not removed. "
+                   "Columns found: " + ", ".join(map(str, out.columns)))
+    missing_cols = [lbl for lbl, col in keep if col is None]
+    if missing_cols:
+        st.warning("Couldn't find column(s): " + ", ".join(missing_cols)
+                   + ". File columns: " + ", ".join(map(str, out.columns)))
+    st.dataframe(reduced, use_container_width=True, hide_index=True)
+    export_buttons(reduced, "flex_stock_cleaned")
+    st.session_state["flex_cleaned"] = reduced
 
-    # ── Pull ALL info for each SKU from connect.oskarme.com ───────────────────
-    st.markdown(section_label("Get all info from connect"), unsafe_allow_html=True)
-    connect_col = _connect_sku_col(sku_cols)
-    st.caption(f"Looking up connect by **{connect_col}** (merchant SKU).")
-    skus = [s for s in dict.fromkeys(out[connect_col].astype(str).tolist()) if s.strip()]
+    # ── VLOOKUP: match each Msku to connect's SKU → bring back Southbay stock ──
+    st.markdown(section_label("Southbay stock from connect (matched by Msku)"),
+                unsafe_allow_html=True)
+    if msku_col is None:
+        st.info("No Msku column found, so the connect Southbay lookup can't run.")
+        return
+    mskus = [s for s in dict.fromkeys(reduced["Msku"].astype(str).tolist()) if s.strip()]
     if db.get_setting("use_mock_oskar", "1") == "1":
         st.info("MOCK enrichment is ON (Settings → Connections → 'Use MOCK enrichment'). "
                 "Turn it OFF to pull real connect.oskarme.com data.")
-    if st.button(f"🔗 Get all info from connect for {len(skus)} SKU(s)",
+
+    # ── Diagnostic: see the RAW connect response for one Msku ─────────────────
+    # (Confirms connect is reachable from THIS machine, and shows exactly where
+    #  Southbay stock lives so the lookup can be pointed at the right field.)
+    with st.expander("🔬 Diagnose connect — test one Msku"):
+        tsku = st.text_input("Msku to test", value=(mskus[0] if mskus else ""),
+                             key="sb_diag_sku")
+        if st.button("Test connect stock lookup", key="sb_diag_btn") and tsku.strip():
+            with st.spinner("Calling connect…"):
+                res = oskar_source.fetch_stock_bulk([tsku.strip()])
+            info = res.get(tsku.strip(), {})
+            if info.get("ok"):
+                st.success(f"connect reachable ✓ — stock (qty) for {tsku.strip()}: "
+                           f"**{info.get('qty')}** {info.get('reason') and '('+info['reason']+')'}")
+            else:
+                st.error(f"connect call FAILED: {info.get('reason')}")
+                st.caption("If that's a timeout/connection error, this machine can't reach "
+                           "connect.oskarme.com — check your network/VPN and the oskar token "
+                           "in Settings, then retry.")
+    if st.button(f"🔗 Get Southbay stock from connect for {len(mskus)} Msku(s)",
                  use_container_width=True, type="primary"):
-        rows, prog = [], st.progress(0.0)
-        with st.spinner("Fetching product info from connect.oskarme.com…"):
-            for i, sku in enumerate(skus):
-                info = oskar_source.fetch_product_info(sku)
-                row = {"SKU": sku, "Found": "✓" if info.get("ok") else "✗",
-                       "Images": len(info.get("images") or [])}
-                row.update(_flatten_scalars(info.get("data")))
-                if not info.get("ok") and info.get("reason"):
-                    row["Note"] = info["reason"]
-                rows.append(row)
-                prog.progress((i + 1) / max(len(skus), 1))
-        st.session_state["flex_connect_info"] = pd.DataFrame(rows)
+        cache = st.session_state.setdefault("connect_sb_cache", {})
+        todo = [m for m in mskus if m not in cache]          # only fetch new ones
+        if todo:
+            with st.spinner(f"Fetching Southbay stock for {len(todo)} Msku(s) from connect "
+                            f"(parallel)…"):
+                results = oskar_source.fetch_stock_bulk(todo, max_workers=16)
+            for m in todo:
+                info = results.get(m, {})
+                cache[m] = info.get("qty", "") if info.get("ok") else ""
+        st.session_state["flex_southbay_map"] = {m: cache.get(m, "") for m in mskus}
         st.rerun()
 
-    enriched = st.session_state.get("flex_connect_info")
-    if enriched is not None and not enriched.empty:
-        found = int((enriched.get("Found") == "✓").sum()) if "Found" in enriched else 0
-        st.caption(f"connect returned info for {found} of {len(enriched)} SKU(s).")
-        st.dataframe(enriched, use_container_width=True, hide_index=True)
-        export_buttons(enriched, "flex_connect_info")
+    sb_map = st.session_state.get("flex_southbay_map")
+    if sb_map:
+        final = reduced.copy()
+        final["Southbay Stock"] = final["Msku"].astype(str).map(
+            lambda m: sb_map.get(m, ""))
+        with_sb = int((final["Southbay Stock"].astype(str).str.strip() != "").sum())
+        st.caption(f"Southbay stock returned for {with_sb} of {len(final)} rows "
+                   f"(cached — re-runs are instant).")
+        if with_sb == 0:
+            st.warning("connect returned no stock for any Msku. Use the 🔬 diagnostic above to "
+                       "check connect is reachable and the Msku matches a product.")
+        st.dataframe(final, use_container_width=True, hide_index=True)
+        export_buttons(final, "flex_stock_with_southbay")
 
 
 def render(nav=None) -> None:

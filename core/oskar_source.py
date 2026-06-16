@@ -108,13 +108,55 @@ def fetch_images_from_media_link(media_link: str, sku: str = "") -> dict:
         return {"images": [], "ok": False, "reason": f"oskar fetch error: {e}"}
 
 
+_CONNECT_SESSION = None
+
+
+def _connect_session():
+    """Shared, connection-pooled session so bulk lookups reuse TCP/TLS connections
+    (one handshake instead of one-per-SKU) — the main reason sequential was slow."""
+    global _CONNECT_SESSION
+    if _CONNECT_SESSION is None:
+        import requests
+        from requests.adapters import HTTPAdapter
+        s = requests.Session()
+        ad = HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=1)
+        s.mount("https://", ad)
+        s.mount("http://", ad)
+        _CONNECT_SESSION = s
+    return _CONNECT_SESSION
+
+
+def _parse_connect(data_json, sku) -> dict:
+    data = (data_json or {}).get("data") or {}
+    media = data.get("media") or {}
+    imgs = []
+    if media.get("primaryImage"):
+        imgs.append(media["primaryImage"])
+    imgs += [u for u in (media.get("images") or []) if u]
+    imgs = [u for u in dict.fromkeys(imgs) if isinstance(u, str) and u.startswith("http")]
+    return {"ok": True, "sku": sku, "data": data, "images": imgs, "reason": ""}
+
+
+def _fetch_one(sess, base: str, token: str, sku: str, timeout: int = 12) -> dict:
+    """One connect GET using a shared session. No DB access (safe to call in threads)."""
+    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    if token:
+        headers["Authorization"] = token   # raw token, NOT "Bearer ..."
+    try:
+        r = sess.get(f"{base}/api/v1/product/combined-media",
+                     params={"item": sku}, headers=headers, timeout=timeout)
+        if r.status_code == 401:
+            return {"ok": False, "sku": sku, "data": {}, "images": [],
+                    "reason": "unauthorized — add/refresh your oskar token in Settings"}
+        r.raise_for_status()
+        return _parse_connect(r.json(), sku)
+    except Exception as e:
+        return {"ok": False, "sku": sku, "data": {}, "images": [], "reason": f"connect error: {e}"}
+
+
 def fetch_product_info(sku: str) -> dict:
     """Fetch the FULL product record for ONE SKU from connect.oskarme.com.
-
-    Same endpoint as the media fetch (GET /api/v1/product/combined-media?item=<sku>),
-    but returns EVERYTHING connect sends back, not just images:
-        {'ok':bool, 'sku':sku, 'data':<raw 'data' object>, 'images':[url,...], 'reason':str}
-    `data` is whatever connect provides for the product (specs, names, etc.).
+    Returns {'ok':bool, 'sku':sku, 'data':<raw 'data' object>, 'images':[url,...], 'reason':str}.
     """
     sku = str(sku).strip()
     if not sku:
@@ -126,27 +168,87 @@ def fetch_product_info(sku: str) -> dict:
     base = (db.get_setting("oskar_base_url", "https://connect.oskarme.com") or
             "https://connect.oskarme.com").rstrip("/")
     token = db.get_setting("oskar_token", "")
+    return _fetch_one(_connect_session(), base, token, sku)
+
+
+def _fetch_stock_one(sess, base: str, token: str, sku: str, timeout: int = 30) -> dict:
+    """Stock qty for ONE SKU from connect's product list (GET /product/list?search=<sku>).
+    Matches the row whose 'sku' equals the lookup value. Returns {'ok','sku','qty','reason'}."""
+    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    if token:
+        headers["Authorization"] = token
     try:
-        import requests
-        headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-        if token:
-            headers["Authorization"] = token   # raw token, NOT "Bearer ..."
-        r = requests.get(f"{base}/api/v1/product/combined-media",
-                         params={"item": sku}, headers=headers, timeout=25)
+        r = sess.get(f"{base}/api/v1/product/list", params={"search": sku},
+                     headers=headers, timeout=timeout)
         if r.status_code == 401:
-            return {"ok": False, "sku": sku, "data": {}, "images": [],
-                    "reason": "unauthorized — add/refresh your oskar token in Settings"}
+            return {"ok": False, "sku": sku, "qty": "",
+                    "reason": "unauthorized — refresh oskar token in Settings"}
         r.raise_for_status()
-        data = (r.json() or {}).get("data") or {}
-        media = data.get("media") or {}
-        imgs = []
-        if media.get("primaryImage"):
-            imgs.append(media["primaryImage"])
-        imgs += [u for u in (media.get("images") or []) if u]
-        imgs = [u for u in dict.fromkeys(imgs) if isinstance(u, str) and u.startswith("http")]
-        return {"ok": True, "sku": sku, "data": data, "images": imgs, "reason": ""}
+        data = (r.json() or {}).get("data") or []
+        low = str(sku).strip().lower()
+        match = next((d for d in data if str(d.get("sku", "")).strip().lower() == low), None)
+        if match is None and len(data) == 1:   # single result → take it
+            match = data[0]
+        if match is None:
+            return {"ok": True, "sku": sku, "qty": "", "reason": "no exact SKU match"}
+        return {"ok": True, "sku": sku, "qty": match.get("qty", ""), "reason": ""}
     except Exception as e:
-        return {"ok": False, "sku": sku, "data": {}, "images": [], "reason": f"connect error: {e}"}
+        return {"ok": False, "sku": sku, "qty": "", "reason": f"connect error: {e}"}
+
+
+def fetch_stock_bulk(skus, max_workers: int = 12, timeout: int = 30) -> dict:
+    """Stock qty for many SKUs from connect, CONCURRENTLY → {sku: {'ok','qty',...}}.
+    Uses the fast product-list/search endpoint (not the heavy combined-media one)."""
+    skus = [str(s).strip() for s in (skus or []) if str(s).strip()]
+    out: dict = {}
+    if not skus:
+        return out
+    if _use_mock():
+        # mock: derive a stable pseudo-qty so the column isn't empty in demo mode
+        return {s: {"ok": True, "sku": s, "qty": (abs(hash(s)) % 200) + 1, "reason": ""}
+                for s in skus}
+    base = (db.get_setting("oskar_base_url", "https://connect.oskarme.com") or
+            "https://connect.oskarme.com").rstrip("/")
+    token = db.get_setting("oskar_token", "")
+    sess = _connect_session()
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    workers = max(1, min(max_workers, len(skus)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_fetch_stock_one, sess, base, token, s, timeout): s for s in skus}
+        for fut in as_completed(futs):
+            s = futs[fut]
+            try:
+                out[s] = fut.result()
+            except Exception as e:
+                out[s] = {"ok": False, "sku": s, "qty": "", "reason": str(e)}
+    return out
+
+
+def fetch_products_bulk(skus, max_workers: int = 12, timeout: int = 12) -> dict:
+    """Fetch many SKUs from connect CONCURRENTLY → {sku: result}. Settings are read
+    ONCE; requests run in a thread pool over a pooled session, so N lookups take
+    ~N/workers round-trips instead of N sequential ones."""
+    skus = [str(s).strip() for s in (skus or []) if str(s).strip()]
+    out: dict = {}
+    if not skus:
+        return out
+    if _use_mock():
+        return {s: fetch_product_info(s) for s in skus}
+    base = (db.get_setting("oskar_base_url", "https://connect.oskarme.com") or
+            "https://connect.oskarme.com").rstrip("/")
+    token = db.get_setting("oskar_token", "")
+    sess = _connect_session()
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    workers = max(1, min(max_workers, len(skus)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_fetch_one, sess, base, token, s, timeout): s for s in skus}
+        for fut in as_completed(futs):
+            s = futs[fut]
+            try:
+                out[s] = fut.result()
+            except Exception as e:
+                out[s] = {"ok": False, "sku": s, "data": {}, "images": [], "reason": str(e)}
+    return out
 
 
 # ---------------------------------------------------------------------------
